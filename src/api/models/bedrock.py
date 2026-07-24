@@ -871,6 +871,14 @@ class BedrockModel(BaseChatModel):
                         raise ValueError("tool_choice must contain 'function' key when specifying a specific tool")
                     tool_config["toolChoice"] = {"tool": {"name": chat_request.tool_choice["function"].get("name", "")}}
             args["toolConfig"] = tool_config
+        else:
+            # MANAI-1749: Bedrock requires toolConfig when toolUse/toolResult
+            # content blocks are present in message history. OpenAI-compatible
+            # clients may omit the tools param on follow-up requests after tool
+            # execution. Inject a minimal toolConfig from the tool names in history.
+            tool_specs = self._extract_tool_specs_from_messages(messages)
+            if tool_specs:
+                args["toolConfig"] = {"tools": tool_specs}
         # Add additional fields to enable extend thinking or other model-specific features
         if chat_request.extra_body:
             # Filter out prompt_caching (our control field, not for Bedrock)
@@ -1241,6 +1249,42 @@ class BedrockModel(BaseChatModel):
                 },
             }
         }
+
+    def _extract_tool_specs_from_messages(self, messages: list[dict]) -> list[dict]:
+        """Extract minimal tool specs from toolUse blocks in message history.
+
+        Bedrock's Converse API requires toolConfig whenever toolUse or toolResult
+        content blocks are present in the message history. OpenAI-compatible clients
+        (e.g., OpenWebUI) may not re-send the tools parameter on follow-up requests
+        after tool execution. This method builds a minimal toolConfig from the tool
+        names found in the conversation so Bedrock accepts the request.
+
+        :param messages: Parsed Bedrock-format messages.
+        :return: List of toolSpec dicts, or empty list if no tool blocks found.
+        """
+        tool_names_seen: set[str] = set()
+        tool_specs: list[dict] = []
+
+        for msg in messages:
+            for content_block in msg.get("content", []):
+                if "toolUse" in content_block:
+                    name = content_block["toolUse"].get("name", "")
+                    if name and name not in tool_names_seen:
+                        tool_names_seen.add(name)
+                        tool_specs.append({
+                            "toolSpec": {
+                                "name": name,
+                                "description": f"Tool: {name}",
+                                "inputSchema": {
+                                    "json": {
+                                        "type": "object",
+                                        "properties": {},
+                                    }
+                                },
+                            }
+                        })
+
+        return tool_specs
 
     def _calc_budget_tokens(
         self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]
